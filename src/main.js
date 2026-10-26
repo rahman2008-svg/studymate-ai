@@ -1,31 +1,30 @@
 import './style.css';
-import { Needle, tool } from 'cactus-needle/browser';
+import { createNeedle, tool } from 'cactus-needle/browser';
 
 const app = document.querySelector('#app');
 const tasks = JSON.parse(localStorage.getItem('sm-tasks') || '[]');
-let needle;
+
+let needle = null;
+let loadingPromise = null;
 
 app.innerHTML = `
   <header class="top">
     <div class="brand">📚 StudyMate <span>AI</span></div>
     <div class="sub">Your personal study planner</div>
   </header>
-
   <main>
     <section class="welcome">
       <p class="eyebrow">YOUR LEARNING SPACE</p>
       <h1>পড়াশোনা হোক <span>সহজ!</span></h1>
       <p>তোমার পড়ার কাজ লেখো। AI দিয়ে সেগুলো গুছিয়ে নাও।</p>
     </section>
-
     <section class="panel">
       <h2>✨ AI Study Assistant</h2>
       <label for="studyInput">আজ কী কী পড়তে হবে?</label>
       <textarea id="studyInput" placeholder="যেমন: আজ গণিত ৩০ মিনিট, ইংরেজি ২০ মিনিট পড়ব।"></textarea>
       <button id="aiBtn">✨ AI দিয়ে সাজাও</button>
-      <p id="status" role="status">মডেল প্রথমবার লোড হতে কিছু সময় লাগতে পারে।</p>
+      <p id="status" role="status">প্রথমবার মডেল ডাউনলোড হতে পারে।</p>
     </section>
-
     <section class="panel">
       <div class="section-title">
         <h2>📋 আমার পড়ার তালিকা</h2>
@@ -41,6 +40,13 @@ app.innerHTML = `
 const input = document.querySelector('#studyInput');
 const status = document.querySelector('#status');
 const aiBtn = document.querySelector('#aiBtn');
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;',
+    '"': '&quot;', "'": '&#39;'
+  })[char]);
+}
 
 function renderTasks() {
   const list = document.querySelector('#taskList');
@@ -74,13 +80,6 @@ function renderTasks() {
   });
 }
 
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, char => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;',
-    '"': '&quot;', "'": '&#39;'
-  })[char]);
-}
-
 function save() {
   localStorage.setItem('sm-tasks', JSON.stringify(tasks));
   renderTasks();
@@ -95,6 +94,88 @@ function addTask(subject, title, minutes = 25) {
   });
 }
 
+async function getNeedle() {
+  if (needle) return needle;
+  if (loadingPromise) return loadingPromise;
+
+  loadingPromise = createNeedle({
+    cache: true,
+    tools: {
+      extract_study_tasks: tool({
+        description: 'Extract study tasks explicitly mentioned by the student. Preserve the original language.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tasks: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  subject: { type: 'string' },
+                  title: { type: 'string' },
+                  minutes: { type: 'integer' }
+                },
+                required: ['subject', 'title', 'minutes']
+              }
+            }
+          },
+          required: ['tasks']
+        }
+      })
+    },
+    onDownloadProgress({ loaded, total, percentage }) {
+      if (Number.isFinite(percentage)) {
+        status.textContent = `LLM মডেল ডাউনলোড হচ্ছে: ${Math.round(percentage)}%`;
+      } else {
+        const mb = (loaded / (1024 * 1024)).toFixed(1);
+        const totalMb = total ? ` / ${(total / (1024 * 1024)).toFixed(1)} MB` : '';
+        status.textContent = `LLM মডেল ডাউনলোড হচ্ছে: ${mb}${totalMb}`;
+      }
+    }
+  }).then(instance => {
+    needle = instance;
+    return instance;
+  }).catch(error => {
+    loadingPromise = null;
+    throw error;
+  });
+
+  return loadingPromise;
+}
+
+function fallbackTasks(text) {
+  const result = [];
+  const lines = text.split(/[\n,;।]+/).map(line => line.trim()).filter(Boolean);
+
+  const subjects = [
+    ['গণিত', /গণিত|ম্যাথ|math(?:ematics)?/i],
+    ['ইংরেজি', /ইংরেজি|english/i],
+    ['বিজ্ঞান', /বিজ্ঞান|science/i],
+    ['পদার্থবিজ্ঞান', /পদার্থবিজ্ঞান|physics/i],
+    ['রসায়ন', /রসায়ন|chemistry/i],
+    ['জীববিজ্ঞান', /জীববিজ্ঞান|biology/i],
+    ['ইতিহাস', /ইতিহাস|history/i],
+    ['ভূগোল', /ভূগোল|geography/i],
+    ['আইসিটি', /আইসিটি|\bICT\b|computer/i]
+  ];
+
+  for (const line of lines) {
+    const match = line.match(/(\d+)\s*(মিনিট|মিনিটের|ঘণ্টা|ঘন্টা|minutes?|mins?|hours?|hrs?)/i);
+    const subject = subjects.find(([, pattern]) => pattern.test(line));
+    if (!subject) continue;
+
+    let minutes = 25;
+    if (match) {
+      minutes = Number(match[1]);
+      if (/ঘণ্টা|ঘন্টা|hours?|hrs?/i.test(match[2])) minutes *= 60;
+    }
+
+    result.push({ subject: subject[0], title: line, minutes });
+  }
+
+  return result;
+}
+
 aiBtn.addEventListener('click', async () => {
   const text = input.value.trim();
 
@@ -104,90 +185,41 @@ aiBtn.addEventListener('click', async () => {
   }
 
   aiBtn.disabled = true;
-  status.textContent = 'AI মডেল লোড হচ্ছে… প্রথমবার একটু সময় লাগতে পারে।';
 
   try {
-    if (!needle) {
-      needle = new Needle({
-        tools: {
-          extract_study_tasks: tool({
-            description: 'Extract study tasks explicitly mentioned by the student.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                tasks: {
-                  type: 'array',
-                  items: {
-                    type: 'object',
-                    properties: {
-                      subject: { type: 'string' },
-                      title: { type: 'string' },
-                      minutes: { type: 'integer' }
-                    },
-                    required: ['subject', 'title', 'minutes']
-                  }
-                }
-              },
-              required: ['tasks']
-            }
-          })
-        }
-      });
-    }
+    status.textContent = 'LLM মডেল প্রস্তুত করা হচ্ছে…';
+    const model = await getNeedle();
 
     status.textContent = 'AI তোমার পড়ার কাজ বিশ্লেষণ করছে…';
-    const result = await needle.complete(
-      'Extract the study tasks from this student text. Keep the original language. Do not invent tasks or durations. If a duration is not stated, use 25 minutes. Text: ' + text
+
+    const result = await model.generate({
+      prompt: `Extract study tasks from the student's text. Keep the original language. Do not invent subjects or durations. If duration is not stated, use 25 minutes. Call extract_study_tasks with the results. Student text: ${text}`
+    });
+
+    console.log('Needle result:', result);
+
+    const call = result.toolCalls?.find(
+      item => item.toolName === 'extract_study_tasks'
     );
 
-    console.log('Needle result:', JSON.stringify(result, null, 2));
+    let extracted = call?.input?.tasks;
 
-    const call = result.function_calls?.find(
-      item => item.name === 'extract_study_tasks'
-    );
-
-    let extracted = call?.arguments?.tasks;
-
-    // Fallback: recognize simple English study tasks if the model
-    // does not return a usable tool call.
     if (!Array.isArray(extracted) || extracted.length === 0) {
-      const fallback = [];
-      const lines = text.split(/[\n,;]+/).map(line => line.trim()).filter(Boolean);
-
-      for (const line of lines) {
-        const duration = line.match(/(\d+)\s*(minutes?|mins?|hours?|hrs?)/i);
-        const subjectMatch = line.match(/\b(math(?:ematics)?|english|science|physics|chemistry|biology|history|geography|ict|computer)\b/i);
-
-        if (!subjectMatch) continue;
-
-        let minutes = 25;
-        if (duration) {
-          minutes = Number(duration[1]);
-          if (/hours?|hrs?/i.test(duration[2])) minutes *= 60;
-        }
-
-        fallback.push({
-          subject: subjectMatch[1],
-          title: line,
-          minutes
-        });
-      }
-
-      extracted = fallback;
+      extracted = fallbackTasks(text);
     }
 
     if (!Array.isArray(extracted) || extracted.length === 0) {
-      status.textContent = 'কাজ শনাক্ত হয়নি। লিখে দেখো: Study Math for 30 minutes.';
+      status.textContent = 'কাজ শনাক্ত হয়নি। বিষয় ও সময় লিখে আবার চেষ্টা করো।';
       return;
     }
 
     extracted.forEach(task => addTask(task.subject, task.title, task.minutes));
     save();
-    status.textContent = `সফল! AI ${extracted.length}টি পড়ার কাজ যোগ করেছে।`;
     input.value = '';
+    status.textContent = `সফল! ${extracted.length}টি পড়ার কাজ যোগ হয়েছে।`;
   } catch (error) {
     console.error('Needle error:', error);
-    status.textContent = 'মডেল চালু করা যায়নি। ইন্টারনেট সংযোগ পরীক্ষা করে আবার চেষ্টা করো।';
+    status.textContent = `LLM চালু করা যায়নি: ${error?.message || error}. ইন্টারনেট পরীক্ষা করে আবার চেষ্টা করো।`;
   } finally {
     aiBtn.disabled = false;
   }
